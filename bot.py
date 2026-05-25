@@ -2,7 +2,7 @@
 """
 Crypto Momentum Rotation Bot
 Scores BTC, ETH, SOL, LINK, UNI by 28-day momentum every 7 days,
-filters to assets above their 20-day MA, and holds the top 2 equally weighted.
+holds the top 2 with positive momentum equally weighted.
 """
 
 import os
@@ -33,7 +33,7 @@ UNIVERSE = ["BTC/USD", "ETH/USD", "SOL/USD", "LINK/USD", "UNI/USD"]
 TRADE_SYM = {s: s.replace("/", "") for s in UNIVERSE}
 
 REBALANCE_EVERY_DAYS = 7
-CHECK_EVERY_HOURS    = 24
+CHECK_EVERY_HOURS    = 1
 MOMENTUM_DAYS        = 28
 MA_PERIOD            = 20
 TOP_N                = 2
@@ -83,12 +83,7 @@ def fetch_bars(data_client: CryptoHistoricalDataClient) -> pd.DataFrame:
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
 def score_assets(bars_df: pd.DataFrame) -> dict[str, float]:
-    """
-    Returns {symbol: momentum} for assets that are:
-      - above their 20-day MA
-      - have enough history
-    Logs details for every asset regardless of filter outcome.
-    """
+    """Returns {symbol: momentum} for assets with positive momentum and enough history."""
     scores: dict[str, float] = {}
 
     for symbol in UNIVERSE:
@@ -108,17 +103,13 @@ def score_assets(bars_df: pd.DataFrame) -> dict[str, float]:
             current_price = float(close.iloc[-1])
             past_price    = float(close.iloc[-MOMENTUM_DAYS])
             momentum      = (current_price - past_price) / past_price
-            ma20          = float(close.tail(MA_PERIOD).mean())
-            above_ma      = current_price > ma20
 
             logger.info(
                 f"SCORE  {symbol}: price=${current_price:,.4f}  "
-                f"28d_mom={momentum:+.2%}  "
-                f"20d_MA=${ma20:,.4f}  "
-                f"above_MA={above_ma}"
+                f"28d_mom={momentum:+.2%}"
             )
 
-            if above_ma:
+            if momentum > 0:
                 scores[symbol] = momentum
 
         except Exception as exc:
@@ -225,7 +216,6 @@ def run():
     logger.info(f"Universe         : {UNIVERSE}")
     logger.info(f"Rebalance every  : {REBALANCE_EVERY_DAYS} days")
     logger.info(f"Momentum window  : {MOMENTUM_DAYS} days")
-    logger.info(f"MA filter        : {MA_PERIOD}-day SMA")
     logger.info(f"Positions held   : top {TOP_N}")
     logger.info("=" * 60)
 
@@ -250,12 +240,12 @@ def run():
                 scores  = score_assets(bars_df)
 
                 if not scores:
-                    logger.warning("No assets passed the MA filter — holding cash, skipping rebalance")
+                    logger.warning("No assets with positive momentum — holding cash, skipping rebalance")
                 else:
                     ranked       = sorted(scores.items(), key=lambda x: x[1], reverse=True)
                     top_symbols  = [sym for sym, _ in ranked[:TOP_N]]
 
-                    logger.info("Momentum rank (MA-filtered):")
+                    logger.info("Momentum rank:")
                     for i, (sym, mom) in enumerate(ranked, 1):
                         tag = " ← SELECTED" if sym in top_symbols else ""
                         logger.info(f"  {i}. {sym}  {mom:+.2%}{tag}")
