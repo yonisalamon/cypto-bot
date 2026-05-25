@@ -1,0 +1,40 @@
+2026-05-25 12:04:11 [INFO] ============================================================
+2026-05-25 12:04:11 [INFO] Crypto Momentum Rotation Bot  —  starting
+2026-05-25 12:04:11 [INFO] Universe         : ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LINK/USD', 'UNI/USD']
+2026-05-25 12:04:11 [INFO] Rebalance every  : 7 days
+2026-05-25 12:04:11 [INFO] Momentum window  : 28 days
+2026-05-25 12:04:11 [INFO] MA filter        : 20-day SMA
+2026-05-25 12:04:11 [INFO] Positions held   : top 2
+2026-05-25 12:04:11 [INFO] ============================================================
+2026-05-25 12:04:11 [INFO] Connected  —  account equity=$100,000.00
+2026-05-25 12:04:11 [INFO] ── Check at 2026-05-25 16:04:11 UTC ──
+2026-05-25 12:04:11 [INFO] Rebalance due — fetching market data…
+2026-05-25 12:04:11 [INFO] SCORE  BTC/USD: price=$77,527.5880  28d_mom=+1.58%  20d_MA=$78,848.9954  above_MA=False
+2026-05-25 12:04:11 [INFO] SCORE  ETH/USD: price=$2,124.6550  28d_mom=-7.20%  20d_MA=$2,211.7070  above_MA=False
+2026-05-25 12:04:11 [INFO] SCORE  SOL/USD: price=$86.1210  28d_mom=+2.60%  20d_MA=$88.9545  above_MA=False
+2026-05-25 12:04:11 [INFO] SCORE  LINK/USD: price=$9.5928  28d_mom=+3.83%  20d_MA=$9.9290  above_MA=False
+2026-05-25 12:04:11 [INFO] SCORE  UNI/USD: price=$3.3649  28d_mom=+3.83%  20d_MA=$3.5906  above_MA=False
+2026-05-25 12:04:11 [WARNING] No assets passed the MA filter — holding cash, skipping rebalance
+2026-05-25 12:04:11 [INFO] PORTFOLIO  equity=$100,000.00  cash=$100,000.00
+2026-05-25 12:04:11 [INFO]   (no open positions — fully in cash)
+2026-05-25 12:04:11 [INFO] Sleeping 24h until next check…
+2026-05-25 12:09:47 [INFO] ============================================================
+2026-05-25 12:09:47 [INFO] Crypto Momentum Rotation Bot  —  starting
+2026-05-25 12:09:47 [INFO] Universe         : ['BTC/USD', 'ETH/USD', 'SOL/USD', 'LINK/USD', 'UNI/USD']
+2026-05-25 12:09:47 [INFO] Rebalance every  : 7 days
+2026-05-25 12:09:47 [INFO] Momentum window  : 28 days
+2026-05-25 12:09:47 [INFO] MA filter        : 20-day SMA
+2026-05-25 12:09:47 [INFO] Positions held   : top 2
+2026-05-25 12:09:47 [INFO] ============================================================
+2026-05-25 12:09:47 [INFO] Connected  —  account equity=$100,000.00
+2026-05-25 12:09:47 [INFO] ── Check at 2026-05-25 16:09:47 UTC ──
+2026-05-25 12:09:47 [INFO] Rebalance due — fetching market data…
+2026-05-25 12:09:48 [INFO] SCORE  BTC/USD: price=$77,535.1305  28d_mom=+1.59%  20d_MA=$78,849.3725  above_MA=False
+2026-05-25 12:09:48 [INFO] SCORE  ETH/USD: price=$2,125.8550  28d_mom=-7.15%  20d_MA=$2,211.7670  above_MA=False
+2026-05-25 12:09:48 [INFO] SCORE  SOL/USD: price=$86.1604  28d_mom=+2.64%  20d_MA=$88.9565  above_MA=False
+2026-05-25 12:09:48 [INFO] SCORE  LINK/USD: price=$9.5879  28d_mom=+3.78%  20d_MA=$9.9287  above_MA=False
+2026-05-25 12:09:48 [INFO] SCORE  UNI/USD: price=$3.3600  28d_mom=+3.68%  20d_MA=$3.5903  above_MA=False
+2026-05-25 12:09:48 [WARNING] No assets passed the MA filter — holding cash, skipping rebalance
+2026-05-25 12:09:48 [INFO] PORTFOLIO  equity=$100,000.00  cash=$100,000.00
+2026-05-25 12:09:48 [INFO]   (no open positions — fully in cash)
+2026-05-25 12:09:48 [INFO] Sleeping 24h until next check…
