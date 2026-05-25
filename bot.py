@@ -15,10 +15,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (
+    MarketOrderRequest, StopLossRequest, TakeProfitRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.requests import CryptoBarsRequest, CryptoLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
 load_dotenv()
@@ -38,6 +40,8 @@ MOMENTUM_DAYS        = 28
 MA_PERIOD            = 20
 TOP_N                = 2
 MIN_NOTIONAL         = 1.0   # dollars — Alpaca minimum order size
+STOP_LOSS_PCT        = 0.15  # close position if down 15% from entry
+TAKE_PROFIT_PCT      = 0.40  # close position if up 40% from entry
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -127,7 +131,11 @@ def _submit(trading_client: TradingClient, req: MarketOrderRequest, label: str):
         logger.error(f"ORDER FAILED     {label}  —  {exc}")
 
 
-def execute_rebalance(trading_client: TradingClient, top_symbols: list[str]):
+def execute_rebalance(
+    trading_client: TradingClient,
+    data_client: CryptoHistoricalDataClient,
+    top_symbols: list[str],
+):
     top_trade_syms = {TRADE_SYM[s] for s in top_symbols}
 
     # ── Step 1: exit positions not in target ─────────────────────────────────
@@ -158,7 +166,11 @@ def execute_rebalance(trading_client: TradingClient, top_symbols: list[str]):
 
     logger.info(f"REBALANCE  equity=${equity:,.2f}  target_per_asset=${target_each:,.2f}")
 
-    # ── Step 3: buy / trim each target asset ─────────────────────────────────
+    # ── Step 3: fetch live quotes for bracket price calculation ───────────────
+    quote_req     = CryptoLatestQuoteRequest(symbol_or_symbols=top_symbols)
+    latest_quotes = data_client.get_crypto_latest_quote(quote_req)
+
+    # ── Step 4: buy / trim each target asset ─────────────────────────────────
     positions = {p.symbol: p for p in trading_client.get_all_positions()}
 
     for symbol in top_symbols:
@@ -167,11 +179,33 @@ def execute_rebalance(trading_client: TradingClient, top_symbols: list[str]):
         delta         = target_each - current_value
 
         if delta >= MIN_NOTIONAL:
+            quote = latest_quotes.get(symbol)
+            if quote is None:
+                logger.error(f"No quote for {symbol} — skipping bracket buy")
+                continue
+            ref_price    = float(quote.ask_price)
+            qty          = round(delta / ref_price, 8)
+            stop_price   = round(ref_price * (1 - STOP_LOSS_PCT), 4)
+            target_price = round(ref_price * (1 + TAKE_PROFIT_PCT), 4)
+
+            logger.info(
+                f"BRACKET  {tsym}  ref=${ref_price:,.4f}  "
+                f"stop=${stop_price:,.4f} (-{STOP_LOSS_PCT:.0%})  "
+                f"target=${target_price:,.4f} (+{TAKE_PROFIT_PCT:.0%})"
+            )
             _submit(
                 trading_client,
-                MarketOrderRequest(symbol=tsym, notional=round(delta, 2),
-                                   side=OrderSide.BUY, time_in_force=TimeInForce.GTC),
-                f"BUY  {tsym}  notional=${delta:,.2f}",
+                MarketOrderRequest(
+                    symbol=tsym,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC,
+                    order_class=OrderClass.BRACKET,
+                    stop_loss=StopLossRequest(stop_price=stop_price),
+                    take_profit=TakeProfitRequest(limit_price=target_price),
+                ),
+                f"BUY {tsym}  qty={qty:.8f}  ≈${delta:,.2f}  "
+                f"SL=${stop_price:,.4f}  TP=${target_price:,.4f}",
             )
         elif delta <= -MIN_NOTIONAL:
             # Overweight — trim by selling the excess qty
@@ -217,6 +251,8 @@ def run():
     logger.info(f"Rebalance every  : {REBALANCE_EVERY_DAYS} days")
     logger.info(f"Momentum window  : {MOMENTUM_DAYS} days")
     logger.info(f"Positions held   : top {TOP_N}")
+    logger.info(f"Stop loss        : -{STOP_LOSS_PCT:.0%} from entry (bracket order)")
+    logger.info(f"Take profit      : +{TAKE_PROFIT_PCT:.0%} from entry (bracket order)")
     logger.info("=" * 60)
 
     trading_client, data_client = init_clients()
@@ -250,7 +286,7 @@ def run():
                         tag = " ← SELECTED" if sym in top_symbols else ""
                         logger.info(f"  {i}. {sym}  {mom:+.2%}{tag}")
 
-                    execute_rebalance(trading_client, top_symbols)
+                    execute_rebalance(trading_client, data_client, top_symbols)
                     last_rebalance = now
                     logger.info(f"Rebalance complete — next in {REBALANCE_EVERY_DAYS} days")
             else:
