@@ -14,11 +14,13 @@ The instant the bracket resolves, the bot rescores and enters the next trade.
 One position at a time. NYSE market hours only.
 """
 
+import csv
 import os
 import sys
 import time
 import logging
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -27,7 +29,9 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest, StopLossRequest, TakeProfitRequest, GetOrdersRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
+from alpaca.trading.enums import (
+    OrderSide, TimeInForce, OrderClass, OrderStatus, OrderType, QueryOrderStatus,
+)
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
@@ -58,6 +62,28 @@ TAKE_PROFIT_PCT  = 0.25
 POLL_SECS        = 60    # seconds between position checks
 FILL_WAIT_SECS   = 10    # wait after placing before first position check
 MIN_CLOSE_MINS   = 15    # don't open a new position this close to market close
+
+TRADE_LOG   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_log.csv")
+CSV_HEADERS = [
+    "timestamp", "symbol", "side", "entry_price", "exit_price",
+    "pnl_dollar", "pnl_pct", "ema8", "ema21", "ema_gap", "exit_reason",
+]
+
+@dataclass
+class TradeRecord:
+    symbol:        str
+    order_id:      str
+    entry_time:    datetime
+    ema8:          float
+    ema21:         float
+    ema_gap:       float
+    qty:           float           = 0.0
+    entry_price:   float           = 0.0
+    exit_price:    float           = 0.0
+    pnl_dollar:    float           = 0.0
+    pnl_pct:       float           = 0.0
+    exit_reason:   str             = ""
+    resolved_time: datetime | None = None
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -127,23 +153,25 @@ def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
     return data_client.get_stock_bars(req).df
 
 
-def compute_scores(data_client: StockHistoricalDataClient) -> dict[str, float]:
+def compute_scores(
+    data_client: StockHistoricalDataClient,
+) -> tuple[dict[str, float], dict[str, dict]]:
     """
-    Return {symbol: ema_gap} for every symbol in UNIVERSE.
+    Return (scores, ema_details) where:
+      scores      = {symbol: ema_gap}
+      ema_details = {symbol: {"ema8": float, "ema21": float, "ema_gap": float}}
 
     ema_gap = (EMA_FAST - EMA_SLOW) / current_price
-
-    Positive gap  → ETF is trending up relative to its slower average.
-    Negative gap  → ETF is trending down.
     """
     logger.info("── Scoring ──────────────────────────────────────────────")
     try:
         bars_df = fetch_bars(data_client)
     except Exception as exc:
         logger.error(f"Bar fetch failed: {exc}")
-        return {}
+        return {}, {}
 
-    scores: dict[str, float] = {}
+    scores:      dict[str, float] = {}
+    ema_details: dict[str, dict]  = {}
     for symbol in UNIVERSE:
         try:
             lvl0 = bars_df.index.get_level_values(0)
@@ -164,7 +192,8 @@ def compute_scores(data_client: StockHistoricalDataClient) -> dict[str, float]:
             price     = float(close.iloc[-1])
             gap       = (ema_fast - ema_slow) / price
 
-            scores[symbol] = gap
+            scores[symbol]      = gap
+            ema_details[symbol] = {"ema8": ema_fast, "ema21": ema_slow, "ema_gap": gap}
 
             logger.info(
                 f"SCORE  {symbol:<5}  price=${price:>8,.2f}  "
@@ -174,7 +203,7 @@ def compute_scores(data_client: StockHistoricalDataClient) -> dict[str, float]:
         except Exception as exc:
             logger.error(f"SCORE  {symbol}: {exc}")
 
-    return scores
+    return scores, ema_details
 
 
 def pick_trade(scores: dict[str, float]) -> tuple[str, float, str] | None:
@@ -227,14 +256,14 @@ def place_bracket(
     trading_client: TradingClient,
     data_client: StockHistoricalDataClient,
     symbol: str,
-) -> bool:
-    """Fetch live ask price, compute bracket levels, and submit. Returns True on success."""
+) -> str | None:
+    """Fetch live ask price, compute bracket levels, and submit. Returns order ID on success."""
     try:
         quote_req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
         quote     = data_client.get_stock_latest_quote(quote_req).get(symbol)
         if quote is None:
             logger.error(f"No quote available for {symbol}")
-            return False
+            return None
 
         ref_price    = float(quote.ask_price)
         stop_price   = round(ref_price * (1 - STOP_LOSS_PCT), 2)
@@ -247,7 +276,7 @@ def place_bracket(
                 f"Insufficient equity (${equity:,.2f}) to buy 1 share of "
                 f"{symbol} at ${ref_price:,.2f}"
             )
-            return False
+            return None
 
         logger.info(
             f"ENTRY    {symbol}  qty={qty}  ref=${ref_price:,.2f}  "
@@ -255,7 +284,7 @@ def place_bracket(
             f"target=${target_price:,.2f} (+{TAKE_PROFIT_PCT:.0%})"
         )
 
-        trading_client.submit_order(
+        order = trading_client.submit_order(
             MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
@@ -271,11 +300,11 @@ def place_bracket(
             f"ORDER SUBMITTED  BUY {symbol}  qty={qty}  "
             f"SL=${stop_price:,.2f}  TP=${target_price:,.2f}"
         )
-        return True
+        return str(order.id)
 
     except Exception as exc:
         logger.error(f"ORDER FAILED  {symbol}  —  {exc}")
-        return False
+        return None
 
 # ── Pending order check ───────────────────────────────────────────────────────
 
@@ -313,6 +342,76 @@ def log_portfolio(trading_client: TradingClient) -> None:
     except Exception as exc:
         logger.error(f"log_portfolio error: {exc}")
 
+# ── Trade logging ────────────────────────────────────────────────────────────
+
+def resolve_trade(trading_client: TradingClient, rec: TradeRecord) -> bool:
+    """
+    Populate rec.entry_price, exit_price, pnl_*, exit_reason, resolved_time
+    by inspecting the filled bracket order and its legs. Returns True on success.
+    """
+    try:
+        order = trading_client.get_order_by_id(rec.order_id)
+
+        if order.filled_avg_price is None:
+            logger.warning(f"Entry order {rec.order_id} has no fill price yet")
+            return False
+
+        rec.entry_price = float(order.filled_avg_price)
+        rec.qty         = float(order.filled_qty)
+
+        for leg in order.legs or []:
+            if leg.status == OrderStatus.FILLED and leg.filled_avg_price is not None:
+                rec.exit_price  = float(leg.filled_avg_price)
+                rec.exit_reason = (
+                    "stop_loss"   if leg.type == OrderType.STOP  else
+                    "take_profit" if leg.type == OrderType.LIMIT else
+                    "unknown"
+                )
+                break
+
+        if rec.exit_price == 0.0:
+            logger.warning(f"No filled leg found for order {rec.order_id}")
+            return False
+
+        rec.pnl_dollar    = (rec.exit_price - rec.entry_price) * rec.qty
+        rec.pnl_pct       = (rec.exit_price - rec.entry_price) / rec.entry_price
+        rec.resolved_time = datetime.now(timezone.utc)
+        return True
+
+    except Exception as exc:
+        logger.error(f"resolve_trade error: {exc}")
+        return False
+
+
+def log_trade_to_csv(rec: TradeRecord) -> None:
+    """Append one completed trade row to TRADE_LOG, creating the file with headers if needed."""
+    write_header = not os.path.isfile(TRADE_LOG)
+    try:
+        with open(TRADE_LOG, "a", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=CSV_HEADERS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp":   rec.resolved_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol":      rec.symbol,
+                "side":        "buy",
+                "entry_price": round(rec.entry_price, 4),
+                "exit_price":  round(rec.exit_price,  4),
+                "pnl_dollar":  round(rec.pnl_dollar,  2),
+                "pnl_pct":     round(rec.pnl_pct,     6),
+                "ema8":        round(rec.ema8,         4),
+                "ema21":       round(rec.ema21,        4),
+                "ema_gap":     round(rec.ema_gap,      6),
+                "exit_reason": rec.exit_reason,
+            })
+        logger.info(
+            f"TRADE LOG  {rec.symbol}  {rec.exit_reason}  "
+            f"entry=${rec.entry_price:.4f}  exit=${rec.exit_price:.4f}  "
+            f"PnL=${rec.pnl_dollar:+.2f} ({rec.pnl_pct:+.2%})"
+        )
+    except Exception as exc:
+        logger.error(f"log_trade_to_csv error: {exc}")
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run() -> None:
@@ -340,6 +439,11 @@ def run() -> None:
     else:
         logger.info("No open position — will score and enter on next market open")
 
+    # pending holds entry metadata for the trade currently in the bracket;
+    # None when there is no open trade or the position was inherited from a
+    # previous session (in which case we cannot recover the original order ID).
+    pending: TradeRecord | None = None
+
     while True:
         try:
             wait_for_open(trading_client)
@@ -362,6 +466,10 @@ def run() -> None:
 
                 logger.info("★ BRACKET RESOLVED — position closed, rescoring immediately")
                 in_trade = False
+                if pending is not None:
+                    if resolve_trade(trading_client, pending):
+                        log_trade_to_csv(pending)
+                    pending = None
                 # fall through to scoring with no sleep
 
             # ── Looking for a new entry ───────────────────────────────────────
@@ -377,7 +485,7 @@ def run() -> None:
                 continue
 
             # Score and select
-            scores = compute_scores(data_client)
+            scores, ema_details = compute_scores(data_client)
             trade  = pick_trade(scores)
 
             if trade is None:
@@ -393,8 +501,17 @@ def run() -> None:
                 logger.info("Market just closed — will retry at next open")
                 continue
 
-            placed = place_bracket(trading_client, data_client, symbol)
-            if placed:
+            order_id = place_bracket(trading_client, data_client, symbol)
+            if order_id:
+                det     = ema_details.get(symbol, {})
+                pending = TradeRecord(
+                    symbol     = symbol,
+                    order_id   = order_id,
+                    entry_time = datetime.now(timezone.utc),
+                    ema8       = det.get("ema8",     0.0),
+                    ema21      = det.get("ema21",    0.0),
+                    ema_gap    = det.get("ema_gap",  0.0),
+                )
                 in_trade = True
                 logger.info(f"Waiting {FILL_WAIT_SECS} s for entry fill…")
                 time.sleep(FILL_WAIT_SECS)
