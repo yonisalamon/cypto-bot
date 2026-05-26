@@ -404,6 +404,7 @@ def make_bar_handler(
     All shared state access is protected by `lock`.
     """
     async def bar_handler(bar) -> None:
+        logger.info(f"BAR received: {bar.symbol} close={bar.close} time={bar.timestamp}")
         with lock:
             if not shared["in_trade"] or shared["pending"] is None:
                 return
@@ -574,11 +575,15 @@ def run() -> None:
     else:
         logger.info("No open position — will score and enter on next market open")
 
+    async def trade_handler(trade) -> None:
+        logger.info(f"TRADE received: {trade.symbol} price={trade.price}")
+
     stream = StockDataStream(API_KEY, SECRET_KEY, feed=DataFeed.IEX)
     stream.subscribe_bars(
         make_bar_handler(trading_client, data_client, shared, state_lock),
         *UNIVERSE,
     )
+    stream.subscribe_trades(trade_handler, *UNIVERSE)
     stream_thread = threading.Thread(target=stream.run, daemon=True)
     stream_thread.start()
     logger.info(f"Real-time stream started — subscribed to 1-min bars for {UNIVERSE}")
