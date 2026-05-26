@@ -420,9 +420,19 @@ def check_exit(
         )
         return True, "trailing_stop"
 
-    # 3. EMA reversal — daily signal; re-fetch bars each cycle
+    # 3. EMA reversal — intraday 1-min signal; re-fetch bars each cycle
     try:
-        bars_df  = fetch_bars(data_client)
+        end   = datetime.now(timezone.utc)
+        start = end - timedelta(hours=2)
+        req   = StockBarsRequest(
+            symbol_or_symbols=[rec.symbol],
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            feed="iex",
+            limit=60,
+        )
+        bars_df  = data_client.get_stock_bars(req).df
         lvl0     = bars_df.index.get_level_values(0)
         if rec.symbol in lvl0:
             close    = bars_df.loc[rec.symbol].sort_index()["close"]
