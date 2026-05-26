@@ -148,6 +148,7 @@ def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
         start=start,
         end=end,
         adjustment=Adjustment.ALL,
+        feed="iex",
     )
     df = data_client.get_stock_bars(req).df
     # Drop today's bar — it is an incomplete intraday snapshot during market hours,
