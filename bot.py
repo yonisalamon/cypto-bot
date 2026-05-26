@@ -31,7 +31,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import Adjustment
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.live import StockDataStream
 
 load_dotenv()
@@ -574,7 +574,7 @@ def run() -> None:
     else:
         logger.info("No open position — will score and enter on next market open")
 
-    stream = StockDataStream(API_KEY, SECRET_KEY, feed="iex")
+    stream = StockDataStream(API_KEY, SECRET_KEY, feed=DataFeed.IEX)
     stream.subscribe_bars(
         make_bar_handler(trading_client, data_client, shared, state_lock),
         *UNIVERSE,
