@@ -30,11 +30,12 @@ from alpaca.trading.requests import (
     MarketOrderRequest, StopLossRequest, TakeProfitRequest, GetOrdersRequest,
 )
 from alpaca.trading.enums import (
-    OrderSide, TimeInForce, OrderClass, OrderStatus, OrderType, QueryOrderStatus,
+    OrderSide, TimeInForce, OrderClass, OrderStatus, QueryOrderStatus,
 )
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import Adjustment
 
 load_dotenv()
 
@@ -42,7 +43,7 @@ load_dotenv()
 
 API_KEY    = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL   = os.getenv("BASE_URL")
+BASE_URL   = os.getenv("BASE_URL") or None   # treat empty string same as unset
 
 UNIVERSE = ["TQQQ", "SOXL", "UPRO", "TECL", "SQQQ", "SOXS", "SPXS", "TECS"]
 
@@ -109,10 +110,8 @@ logger = setup_logging()
 def init_clients() -> tuple[TradingClient, StockHistoricalDataClient]:
     if not API_KEY or not SECRET_KEY:
         raise RuntimeError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env")
-    if BASE_URL:
-        trading = TradingClient(api_key=API_KEY, secret_key=SECRET_KEY, url_override=BASE_URL)
-    else:
-        trading = TradingClient(api_key=API_KEY, secret_key=SECRET_KEY, paper=True)
+    paper   = BASE_URL is None or "paper" in BASE_URL.lower()
+    trading = TradingClient(api_key=API_KEY, secret_key=SECRET_KEY, paper=paper)
     data = StockHistoricalDataClient(api_key=API_KEY, secret_key=SECRET_KEY)
     return trading, data
 
@@ -148,9 +147,18 @@ def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
-        adjustment="all",
+        adjustment=Adjustment.ALL,
     )
-    return data_client.get_stock_bars(req).df
+    df = data_client.get_stock_bars(req).df
+    # Drop today's bar — it is an incomplete intraday snapshot during market hours,
+    # not a settled close. EMAs must be built on complete daily closes only.
+    # Use positional level (1) to avoid dependency on the SDK's level name.
+    # Match tz-awareness of the index to avoid TypeError on comparison.
+    ts    = df.index.get_level_values(1)
+    today = pd.Timestamp.now(tz="UTC").normalize()   # midnight UTC today
+    if ts.tz is None:
+        today = today.tz_localize(None)
+    return df[ts < today]
 
 
 def compute_scores(
@@ -265,7 +273,14 @@ def place_bracket(
             logger.error(f"No quote available for {symbol}")
             return None
 
-        ref_price    = float(quote.ask_price)
+        ask = quote.ask_price
+        try:
+            ref_price = float(ask or 0)
+        except (TypeError, ValueError):
+            ref_price = 0.0
+        if ref_price <= 0:
+            logger.error(f"Invalid ask price for {symbol} ({ask!r}) — skipping")
+            return None
         stop_price   = round(ref_price * (1 - STOP_LOSS_PCT), 2)
         target_price = round(ref_price * (1 + TAKE_PROFIT_PCT), 2)
 
@@ -308,12 +323,16 @@ def place_bracket(
 
 # ── Pending order check ───────────────────────────────────────────────────────
 
-def has_pending_orders(trading_client: TradingClient) -> bool:
-    """Return True if any open orders exist (unfilled entry or live bracket legs)."""
+def has_pending_orders(trading_client: TradingClient, symbol: str | None = None) -> bool:
+    """
+    Return True if open orders exist for `symbol` (scoped) or any symbol (if None).
+    Scoping to a symbol avoids stale orders from other sources causing an infinite wait.
+    """
     try:
-        orders = trading_client.get_orders(
-            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
-        )
+        kwargs: dict = {"status": QueryOrderStatus.OPEN}
+        if symbol:
+            kwargs["symbols"] = [symbol]
+        orders = trading_client.get_orders(filter=GetOrdersRequest(**kwargs))
         return len(orders) > 0
     except Exception as exc:
         logger.warning(f"Could not check pending orders: {exc}")
@@ -348,30 +367,47 @@ def resolve_trade(trading_client: TradingClient, rec: TradeRecord) -> bool:
     """
     Populate rec.entry_price, exit_price, pnl_*, exit_reason, resolved_time
     by inspecting the filled bracket order and its legs. Returns True on success.
+
+    Retries up to 4 times (2 s apart) because Alpaca can take a moment to
+    mark the filled leg on the parent order after the bracket fires.
     """
     try:
-        order = trading_client.get_order_by_id(rec.order_id)
-
-        if order.filled_avg_price is None:
-            logger.warning(f"Entry order {rec.order_id} has no fill price yet")
-            return False
-
-        rec.entry_price = float(order.filled_avg_price)
-        rec.qty         = float(order.filled_qty)
-
-        for leg in order.legs or []:
-            if leg.status == OrderStatus.FILLED and leg.filled_avg_price is not None:
-                rec.exit_price  = float(leg.filled_avg_price)
-                rec.exit_reason = (
-                    "stop_loss"   if leg.type == OrderType.STOP  else
-                    "take_profit" if leg.type == OrderType.LIMIT else
-                    "unknown"
-                )
+        order      = None
+        filled_leg = None
+        for attempt in range(4):
+            order      = trading_client.get_order_by_id(rec.order_id)
+            filled_leg = next(
+                (lg for lg in (order.legs or [])
+                 if lg.status == OrderStatus.FILLED and lg.filled_avg_price is not None),
+                None,
+            )
+            if filled_leg is not None:
                 break
+            if attempt < 3:
+                logger.info(f"Leg not yet populated — retrying in 2 s… ({attempt + 1}/4)")
+                time.sleep(2)
 
-        if rec.exit_price == 0.0:
-            logger.warning(f"No filled leg found for order {rec.order_id}")
+        entry_avg = float(order.filled_avg_price or 0) if order else 0.0
+        if entry_avg <= 0:
+            logger.warning(f"Entry order {rec.order_id} has no valid fill price")
             return False
+
+        rec.entry_price = entry_avg
+        rec.qty         = float(order.filled_qty or 0)
+
+        if filled_leg is None:
+            logger.warning(f"No filled leg found for order {rec.order_id} after 4 attempts")
+            return False
+
+        rec.exit_price = float(filled_leg.filled_avg_price)
+
+        # getattr(.value) works for both str-enum and plain string SDK responses
+        leg_type_val   = getattr(filled_leg.type, "value", str(filled_leg.type)).lower()
+        rec.exit_reason = (
+            "stop_loss"   if leg_type_val == "stop"  else
+            "take_profit" if leg_type_val == "limit" else
+            "unknown"
+        )
 
         rec.pnl_dollar    = (rec.exit_price - rec.entry_price) * rec.qty
         rec.pnl_pct       = (rec.exit_price - rec.entry_price) / rec.entry_price
@@ -450,6 +486,14 @@ def run() -> None:
             now       = datetime.now(timezone.utc)
             positions = trading_client.get_all_positions()
 
+            # Guard: place_bracket can succeed (order submitted) but raise before
+            # in_trade=True is set. On the next iteration we'd try to open a second
+            # position on top of the existing one. Catch that case and sync the flag.
+            if not in_trade and len(positions) > 0:
+                logger.warning("Open position found with in_trade=False — syncing state")
+                in_trade = True
+                pending  = None
+
             # ── Monitoring an open trade ──────────────────────────────────────
             if in_trade:
                 if len(positions) > 0:
@@ -459,7 +503,7 @@ def run() -> None:
                     continue
 
                 # Position gone — confirm bracket legs have settled too
-                if has_pending_orders(trading_client):
+                if has_pending_orders(trading_client, pending.symbol if pending else None):
                     logger.info("Orders still settling — rechecking in 5 s…")
                     time.sleep(5)
                     continue
