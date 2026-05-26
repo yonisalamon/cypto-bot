@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import logging
+import threading
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
+from alpaca.data.live import StockDataStream
 
 load_dotenv()
 
@@ -388,66 +390,100 @@ def close_position(trading_client: TradingClient, symbol: str) -> float:
         return 0.0
 
 
-# ── Exit signal checks ────────────────────────────────────────────────────────
+# ── Stream exit handler ───────────────────────────────────────────────────────
 
-def check_exit(
+def make_bar_handler(
+    trading_client: TradingClient,
     data_client: StockHistoricalDataClient,
-    rec: TradeRecord,
-    current_price: float,
-) -> tuple[bool, str]:
+    shared: dict,
+    lock: threading.Lock,
+):
     """
-    Evaluate exit conditions in priority order.
-    Returns (should_exit, reason).
+    Returns an async 1-minute bar handler for Alpaca's real-time stream.
+    Checks hard stop, trailing stop, and EMA reversal in priority order.
+    All shared state access is protected by `lock`.
     """
-    if current_price <= 0:
-        return False, ""
+    async def bar_handler(bar) -> None:
+        with lock:
+            if not shared["in_trade"] or shared["pending"] is None:
+                return
+            rec = shared["pending"]
+            if bar.symbol != rec.symbol:
+                return
 
-    # 1. Hard stop — absolute floor, checked first
-    hard_floor = rec.entry_price * (1 - HARD_STOP_PCT)
-    if current_price <= hard_floor:
-        logger.warning(
-            f"HARD STOP  {rec.symbol}  price=${current_price:,.2f}  "
-            f"floor=${hard_floor:,.2f}  entry=${rec.entry_price:,.2f}"
-        )
-        return True, "hard_stop"
+            price = float(bar.close)
 
-    # 2. Trailing stop — locks in gains
-    trail_floor = rec.high_watermark * (1 - TRAIL_STOP_PCT)
-    if current_price <= trail_floor:
-        logger.warning(
-            f"TRAILING STOP  {rec.symbol}  price=${current_price:,.2f}  "
-            f"trail_floor=${trail_floor:,.2f}  watermark=${rec.high_watermark:,.2f}"
-        )
-        return True, "trailing_stop"
-
-    # 3. EMA reversal — intraday 1-min signal; re-fetch bars each cycle
-    try:
-        end   = datetime.now(timezone.utc)
-        start = end - timedelta(hours=2)
-        req   = StockBarsRequest(
-            symbol_or_symbols=[rec.symbol],
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=end,
-            feed="iex",
-            limit=60,
-        )
-        bars_df  = data_client.get_stock_bars(req).df
-        lvl0     = bars_df.index.get_level_values(0)
-        if rec.symbol in lvl0:
-            close    = bars_df.loc[rec.symbol].sort_index()["close"]
-            ema_fast = float(close.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1])
-            ema_mid  = float(close.ewm(span=EMA_MID,  adjust=False).mean().iloc[-1])
-            if ema_fast < ema_mid:
-                logger.info(
-                    f"EMA REVERSAL  {rec.symbol}  "
-                    f"EMA{EMA_FAST}=${ema_fast:,.2f} < EMA{EMA_MID}=${ema_mid:,.2f}"
+            # 1. Hard stop — absolute floor
+            hard_floor = rec.entry_price * (1 - HARD_STOP_PCT)
+            if price <= hard_floor:
+                logger.warning(
+                    f"HARD STOP  {rec.symbol}  price=${price:,.2f}  "
+                    f"floor=${hard_floor:,.2f}  entry=${rec.entry_price:,.2f}"
                 )
-                return True, "ema_reversal"
-    except Exception as exc:
-        logger.warning(f"check_exit EMA fetch: {exc}")
+                exit_reason = "hard_stop"
+            else:
+                # 2. Trailing stop — locks in gains
+                trail_floor = rec.high_watermark * (1 - TRAIL_STOP_PCT)
+                if price <= trail_floor:
+                    logger.warning(
+                        f"TRAILING STOP  {rec.symbol}  price=${price:,.2f}  "
+                        f"trail_floor=${trail_floor:,.2f}  watermark=${rec.high_watermark:,.2f}"
+                    )
+                    exit_reason = "trailing_stop"
+                else:
+                    exit_reason = None
 
-    return False, ""
+            # 3. EMA reversal — only if stops not triggered
+            if exit_reason is None:
+                try:
+                    end   = datetime.now(timezone.utc)
+                    start = end - timedelta(hours=2)
+                    req   = StockBarsRequest(
+                        symbol_or_symbols=[rec.symbol],
+                        timeframe=TimeFrame.Minute,
+                        start=start,
+                        end=end,
+                        feed="iex",
+                        limit=60,
+                    )
+                    bars_df  = data_client.get_stock_bars(req).df
+                    lvl0     = bars_df.index.get_level_values(0)
+                    if rec.symbol in lvl0:
+                        close    = bars_df.loc[rec.symbol].sort_index()["close"]
+                        ema_fast = float(close.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1])
+                        ema_mid  = float(close.ewm(span=EMA_MID,  adjust=False).mean().iloc[-1])
+                        crossed  = ema_fast < ema_mid
+                        logger.info(
+                            f"EMA check — EMA8={ema_fast:.2f}  EMA21={ema_mid:.2f}  crossed={crossed}"
+                        )
+                        if crossed:
+                            logger.info(
+                                f"EMA REVERSAL  {rec.symbol}  "
+                                f"EMA{EMA_FAST}=${ema_fast:,.2f} < EMA{EMA_MID}=${ema_mid:,.2f}"
+                            )
+                            exit_reason = "ema_reversal"
+                except Exception as exc:
+                    logger.error(f"bar_handler EMA reversal failed: {exc}", exc_info=True)
+
+            if exit_reason is not None:
+                logger.info(f"EXIT TRIGGERED: {exit_reason}  {rec.symbol}")
+                fill_price = close_position(trading_client, rec.symbol)
+                if fill_price > 0:
+                    rec.exit_price    = fill_price
+                    rec.exit_reason   = exit_reason
+                    rec.pnl_dollar    = (fill_price - rec.entry_price) * rec.qty
+                    rec.pnl_pct       = (fill_price - rec.entry_price) / rec.entry_price
+                    rec.resolved_time = datetime.now(timezone.utc)
+                    log_trade_to_csv(rec)
+                else:
+                    logger.error(
+                        "close_position returned 0 — fill unconfirmed; "
+                        "manual check required"
+                    )
+                shared["in_trade"] = False
+                shared["pending"]  = None
+
+    return bar_handler
 
 
 # ── Portfolio snapshot ────────────────────────────────────────────────────────
@@ -518,16 +554,19 @@ def run() -> None:
     logger.info(f"Signal        : EMA{EMA_FAST}/EMA{EMA_MID}/EMA{EMA_SLOW} triple alignment")
     logger.info(f"Hard stop     : -{HARD_STOP_PCT:.0%} from entry price")
     logger.info(f"Trailing stop : -{TRAIL_STOP_PCT:.0%} from high watermark")
-    logger.info(f"EMA reversal  : EMA{EMA_FAST} crosses below EMA{EMA_MID}")
+    logger.info(f"EMA reversal  : EMA{EMA_FAST} crosses below EMA{EMA_MID} (stream)")
     logger.info("=" * 60)
 
     trading_client, data_client = init_clients()
     logger.info(f"Connected — equity=${float(trading_client.get_account().equity):,.2f}")
 
+    state_lock = threading.Lock()
+    shared: dict = {"in_trade": False, "pending": None}
+
     existing = trading_client.get_all_positions()
-    in_trade  = len(existing) > 0
-    if in_trade:
+    if existing:
         p = existing[0]
+        shared["in_trade"] = True
         logger.info(
             f"Existing position: {p.symbol}  qty={float(p.qty):.0f}  "
             f"value=${float(p.market_value):,.2f} — monitoring"
@@ -535,7 +574,14 @@ def run() -> None:
     else:
         logger.info("No open position — will score and enter on next market open")
 
-    pending: TradeRecord | None = None
+    stream = StockDataStream(API_KEY, SECRET_KEY, feed="iex")
+    stream.subscribe_bars(
+        make_bar_handler(trading_client, data_client, shared, state_lock),
+        *UNIVERSE,
+    )
+    stream_thread = threading.Thread(target=stream.run, daemon=True)
+    stream_thread.start()
+    logger.info(f"Real-time stream started — subscribed to 1-min bars for {UNIVERSE}")
 
     while True:
         try:
@@ -543,54 +589,42 @@ def run() -> None:
             now       = datetime.now(timezone.utc)
             positions = trading_client.get_all_positions()
 
+            with state_lock:
+                in_trade = shared["in_trade"]
+                pending  = shared["pending"]
+
             # Guard: place_entry can succeed but raise before in_trade=True is set.
             # If a position exists but in_trade is False, sync state to avoid double-entry.
             if not in_trade and len(positions) > 0:
                 logger.warning("Open position found with in_trade=False — syncing state")
-                in_trade = True
-                pending  = None
+                with state_lock:
+                    shared["in_trade"] = True
+                    shared["pending"]  = None
+                time.sleep(POLL_SECS)
+                continue
 
             # ── Monitoring an open trade ──────────────────────────────────────
             if in_trade:
                 if len(positions) == 0:
-                    # Position closed externally (manual close or end-of-day expiry)
+                    # Position closed by stream handler or externally
                     logger.info("Position no longer open — resetting to cash")
-                    in_trade = False
-                    pending  = None
+                    with state_lock:
+                        shared["in_trade"] = False
+                        shared["pending"]  = None
                     continue
 
                 symbol        = pending.symbol if pending else positions[0].symbol
                 current_price = get_current_price(data_client, symbol)
 
                 if current_price > 0 and pending is not None:
-                    pending.high_watermark = max(pending.high_watermark, current_price)
+                    with state_lock:
+                        pending.high_watermark = max(pending.high_watermark, current_price)
 
                 logger.info(
                     f"── Poll {now:%H:%M:%S} UTC  {symbol}  "
                     f"price=${current_price:,.2f} ──"
                 )
                 log_portfolio(trading_client, pending)
-
-                if pending is not None:
-                    should_exit, exit_reason = check_exit(data_client, pending, current_price)
-                    if should_exit:
-                        logger.info(f"EXIT TRIGGERED: {exit_reason}  {symbol}")
-                        fill_price = close_position(trading_client, symbol)
-                        if fill_price > 0:
-                            pending.exit_price    = fill_price
-                            pending.exit_reason   = exit_reason
-                            pending.pnl_dollar    = (fill_price - pending.entry_price) * pending.qty
-                            pending.pnl_pct       = (fill_price - pending.entry_price) / pending.entry_price
-                            pending.resolved_time = datetime.now(timezone.utc)
-                            log_trade_to_csv(pending)
-                        else:
-                            logger.error(
-                                "close_position returned 0 — fill unconfirmed; "
-                                "will recheck on next iteration"
-                            )
-                        in_trade = False
-                        pending  = None
-                        continue  # immediately re-score
 
                 time.sleep(POLL_SECS)
                 continue
@@ -623,8 +657,8 @@ def run() -> None:
 
             order_id, fill_price, fill_qty = place_entry(trading_client, data_client, symbol)
             if order_id and fill_price > 0:
-                det     = ema_details.get(symbol, {})
-                pending = TradeRecord(
+                det         = ema_details.get(symbol, {})
+                new_pending = TradeRecord(
                     symbol         = symbol,
                     order_id       = order_id,
                     entry_time     = datetime.now(timezone.utc),
@@ -636,7 +670,9 @@ def run() -> None:
                     entry_price    = fill_price,
                     high_watermark = fill_price,
                 )
-                in_trade = True
+                with state_lock:
+                    shared["pending"]  = new_pending
+                    shared["in_trade"] = True
                 logger.info(
                     f"IN TRADE: {symbol}  entry=${fill_price:,.2f}  qty={fill_qty:.0f}  "
                     f"hard_floor=${fill_price * (1 - HARD_STOP_PCT):,.2f}  "
