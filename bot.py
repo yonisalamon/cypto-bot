@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Stock Momentum Rotation Bot
-Scores 12 large-cap stocks by 28-day momentum every 7 days,
-holds the top 3 equally weighted. Every buy is a bracket order
-with stop loss at -10% and take profit at +25% from entry.
-Only trades during NYSE market hours.
+Leveraged ETF EMA Momentum Bracket Bot
+
+Scores TQQQ/SOXL/UPRO/TECL and their inverses using the gap between
+the 8-day EMA and 21-day EMA, normalised by price.
+
+  - Largest POSITIVE gap  → buy that ETF directly (trending up)
+  - Largest NEGATIVE gap  → buy the paired inverse ETF (underlying trending down)
+
+Whichever signal has the greater absolute magnitude wins.
+Every entry is a bracket order (SL -10%, TP +25%).
+The instant the bracket resolves, the bot rescores and enters the next trade.
+One position at a time. NYSE market hours only.
 """
 
 import os
@@ -18,8 +25,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    MarketOrderRequest, StopLossRequest, TakeProfitRequest,
-    GetOrdersRequest,
+    MarketOrderRequest, StopLossRequest, TakeProfitRequest, GetOrdersRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -34,22 +40,29 @@ API_KEY    = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL   = os.getenv("BASE_URL")
 
-UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN",
-    "META", "TSLA", "JPM", "V", "UNH", "XOM", "LLY",
-]
+UNIVERSE = ["TQQQ", "SOXL", "UPRO", "TECL", "SQQQ", "SOXS", "SPXS", "TECS"]
 
-REBALANCE_EVERY_DAYS = 7
-MOMENTUM_DAYS        = 28
-TOP_N                = 3
-MIN_NOTIONAL         = 1.0
-STOP_LOSS_PCT        = 0.10
-TAKE_PROFIT_PCT      = 0.25
+# Each ETF paired with its inverse; used to find the buy target for a negative gap
+PAIRS: dict[str, str] = {
+    "TQQQ": "SQQQ", "SQQQ": "TQQQ",
+    "SOXL": "SOXS", "SOXS": "SOXL",
+    "UPRO": "SPXS", "SPXS": "UPRO",
+    "TECL": "TECS", "TECS": "TECL",
+}
+
+EMA_FAST         = 8
+EMA_SLOW         = 21
+LOOKBACK_DAYS    = 90    # enough history for EMAs to converge
+STOP_LOSS_PCT    = 0.10
+TAKE_PROFIT_PCT  = 0.25
+POLL_SECS        = 60    # seconds between position checks
+FILL_WAIT_SECS   = 10    # wait after placing before first position check
+MIN_CLOSE_MINS   = 15    # don't open a new position this close to market close
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def setup_logging() -> logging.Logger:
-    logger = logging.getLogger("stock_bot")
+    logger = logging.getLogger("etf_bot")
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
@@ -67,7 +80,7 @@ logger = setup_logging()
 
 # ── Client initialisation ─────────────────────────────────────────────────────
 
-def init_clients():
+def init_clients() -> tuple[TradingClient, StockHistoricalDataClient]:
     if not API_KEY or not SECRET_KEY:
         raise RuntimeError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env")
     if BASE_URL:
@@ -77,12 +90,33 @@ def init_clients():
     data = StockHistoricalDataClient(api_key=API_KEY, secret_key=SECRET_KEY)
     return trading, data
 
-# ── Data fetching ─────────────────────────────────────────────────────────────
+# ── Market clock helpers ──────────────────────────────────────────────────────
+
+def wait_for_open(trading_client: TradingClient) -> None:
+    """Block until NYSE is open, sleeping precisely until next_open."""
+    while True:
+        clock = trading_client.get_clock()
+        if clock.is_open:
+            return
+        now        = datetime.now(timezone.utc)
+        sleep_secs = max(60, (clock.next_open - now).total_seconds() + 60)
+        logger.info(
+            f"Market closed — next open "
+            f"{clock.next_open.strftime('%Y-%m-%d %H:%M %Z')} "
+            f"({sleep_secs / 3600:.1f} h)"
+        )
+        time.sleep(sleep_secs)
+
+
+def mins_to_close(trading_client: TradingClient) -> float:
+    clock = trading_client.get_clock()
+    return (clock.next_close - datetime.now(timezone.utc)).total_seconds() / 60
+
+# ── EMA scoring ───────────────────────────────────────────────────────────────
 
 def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
-    """Return a MultiIndex (symbol, timestamp) DataFrame of daily closes."""
     end   = datetime.now(timezone.utc)
-    start = end - timedelta(days=MOMENTUM_DAYS + 10)
+    start = end - timedelta(days=LOOKBACK_DAYS)
     req   = StockBarsRequest(
         symbol_or_symbols=UNIVERSE,
         timeframe=TimeFrame.Day,
@@ -92,251 +126,287 @@ def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
     )
     return data_client.get_stock_bars(req).df
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
 
-def score_assets(bars_df: pd.DataFrame) -> dict[str, float]:
-    """Return {symbol: 28-day momentum} for every symbol with enough history."""
+def compute_scores(data_client: StockHistoricalDataClient) -> dict[str, float]:
+    """
+    Return {symbol: ema_gap} for every symbol in UNIVERSE.
+
+    ema_gap = (EMA_FAST - EMA_SLOW) / current_price
+
+    Positive gap  → ETF is trending up relative to its slower average.
+    Negative gap  → ETF is trending down.
+    """
+    logger.info("── Scoring ──────────────────────────────────────────────")
+    try:
+        bars_df = fetch_bars(data_client)
+    except Exception as exc:
+        logger.error(f"Bar fetch failed: {exc}")
+        return {}
+
     scores: dict[str, float] = {}
     for symbol in UNIVERSE:
         try:
-            level0 = bars_df.index.get_level_values(0)
-            if symbol not in level0:
-                logger.warning(f"{symbol}: no data returned — skipping")
+            lvl0 = bars_df.index.get_level_values(0)
+            if symbol not in lvl0:
+                logger.warning(f"SCORE  {symbol:<5}  no data returned")
                 continue
-            df = bars_df.loc[symbol].sort_index()
-            if len(df) < MOMENTUM_DAYS:
-                logger.warning(f"{symbol}: only {len(df)} bars (need {MOMENTUM_DAYS}) — skipping")
+
+            close = bars_df.loc[symbol].sort_index()["close"]
+            if len(close) < EMA_SLOW + 5:
+                logger.warning(
+                    f"SCORE  {symbol:<5}  only {len(close)} bars "
+                    f"(need ≥ {EMA_SLOW + 5})"
+                )
                 continue
-            close         = df["close"]
-            current_price = float(close.iloc[-1])
-            past_price    = float(close.iloc[-MOMENTUM_DAYS])
-            momentum      = (current_price - past_price) / past_price
-            logger.info(f"SCORE  {symbol:<5}  price=${current_price:>9,.2f}  28d_mom={momentum:+.2%}")
-            scores[symbol] = momentum
+
+            ema_fast  = float(close.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1])
+            ema_slow  = float(close.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1])
+            price     = float(close.iloc[-1])
+            gap       = (ema_fast - ema_slow) / price
+
+            scores[symbol] = gap
+
+            logger.info(
+                f"SCORE  {symbol:<5}  price=${price:>8,.2f}  "
+                f"EMA{EMA_FAST}=${ema_fast:>8,.2f}  EMA{EMA_SLOW}=${ema_slow:>8,.2f}  "
+                f"gap={gap:+.4%}"
+            )
         except Exception as exc:
-            logger.error(f"Error scoring {symbol}: {exc}")
+            logger.error(f"SCORE  {symbol}: {exc}")
+
     return scores
 
-# ── Order helpers ─────────────────────────────────────────────────────────────
 
-def _submit(trading_client: TradingClient, req: MarketOrderRequest, label: str):
-    try:
-        trading_client.submit_order(req)
-        logger.info(f"ORDER SUBMITTED  {label}")
-    except Exception as exc:
-        logger.error(f"ORDER FAILED     {label}  —  {exc}")
+def pick_trade(scores: dict[str, float]) -> tuple[str, float, str] | None:
+    """
+    Choose the single best trade from the scored ETFs.
 
+    Two candidates are evaluated:
+      1. ETF with the largest POSITIVE gap  → buy it directly.
+      2. ETF with the largest NEGATIVE gap  → buy its paired inverse ETF.
 
-def _cancel_open_orders(trading_client: TradingClient, symbol: str):
-    """Cancel any open orders for a symbol (e.g. stale bracket legs)."""
-    try:
-        req    = GetOrdersRequest(symbols=[symbol], status=QueryOrderStatus.OPEN)
-        orders = trading_client.get_orders(filter=req)
-        for order in orders:
-            trading_client.cancel_order_by_id(order.id)
-            logger.info(f"CANCELLED order {order.id}  ({symbol})")
-        if orders:
-            time.sleep(2)
-    except Exception as exc:
-        logger.warning(f"Could not cancel orders for {symbol}: {exc}")
+    The candidate with the greater absolute signal wins.
+    Returns (symbol_to_buy, abs_signal, reason) or None if no actionable signal.
+    """
+    if not scores:
+        return None
 
-# ── Rebalancing ───────────────────────────────────────────────────────────────
+    best_pos_sym = max(scores, key=scores.__getitem__)
+    best_pos_gap = scores[best_pos_sym]
 
-def execute_rebalance(
+    best_neg_sym = min(scores, key=scores.__getitem__)
+    best_neg_gap = scores[best_neg_sym]
+
+    candidates: list[tuple[str, float, str]] = []
+
+    if best_pos_gap > 0:
+        candidates.append((
+            best_pos_sym,
+            best_pos_gap,
+            f"direct long on {best_pos_sym} (gap {best_pos_gap:+.4%})",
+        ))
+
+    if best_neg_gap < 0:
+        inverse = PAIRS[best_neg_sym]
+        candidates.append((
+            inverse,
+            abs(best_neg_gap),
+            f"inverse play: {best_neg_sym} gap {best_neg_gap:+.4%} → buy {inverse}",
+        ))
+
+    if not candidates:
+        return None
+
+    # Strongest absolute signal wins
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    return candidates[0]
+
+# ── Bracket order ─────────────────────────────────────────────────────────────
+
+def place_bracket(
     trading_client: TradingClient,
     data_client: StockHistoricalDataClient,
-    top_symbols: list[str],
-):
-    positions = {p.symbol: p for p in trading_client.get_all_positions()}
-    exiting   = [sym for sym in positions if sym not in top_symbols]
+    symbol: str,
+) -> bool:
+    """Fetch live ask price, compute bracket levels, and submit. Returns True on success."""
+    try:
+        quote_req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+        quote     = data_client.get_stock_latest_quote(quote_req).get(symbol)
+        if quote is None:
+            logger.error(f"No quote available for {symbol}")
+            return False
 
-    # ── Step 1: exit positions dropped from the top N ─────────────────────────
-    for sym in exiting:
-        _cancel_open_orders(trading_client, sym)
-        pos = positions[sym]
-        qty = float(pos.qty_available)
-        if qty <= 0:
-            logger.warning(f"SKIP SELL {sym}: no available qty")
-            continue
-        _submit(
-            trading_client,
-            MarketOrderRequest(
-                symbol=sym, qty=qty,
-                side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
-            ),
-            f"SELL {sym}  qty={qty:.0f}  (dropped from top {TOP_N})",
+        ref_price    = float(quote.ask_price)
+        stop_price   = round(ref_price * (1 - STOP_LOSS_PCT), 2)
+        target_price = round(ref_price * (1 + TAKE_PROFIT_PCT), 2)
+
+        equity = float(trading_client.get_account().equity)
+        qty    = int(equity // ref_price)
+        if qty < 1:
+            logger.error(
+                f"Insufficient equity (${equity:,.2f}) to buy 1 share of "
+                f"{symbol} at ${ref_price:,.2f}"
+            )
+            return False
+
+        logger.info(
+            f"ENTRY    {symbol}  qty={qty}  ref=${ref_price:,.2f}  "
+            f"stop=${stop_price:,.2f} (-{STOP_LOSS_PCT:.0%})  "
+            f"target=${target_price:,.2f} (+{TAKE_PROFIT_PCT:.0%})"
         )
 
-    if exiting:
-        logger.info("Waiting 15 s for sell orders to settle…")
-        time.sleep(15)
-
-    # ── Step 2: target allocation ─────────────────────────────────────────────
-    account     = trading_client.get_account()
-    equity      = float(account.equity)
-    target_each = equity / TOP_N
-    logger.info(f"REBALANCE  equity=${equity:,.2f}  target_per_asset=${target_each:,.2f}")
-
-    # ── Step 3: fetch live ask prices for bracket calculation ─────────────────
-    quote_req     = StockLatestQuoteRequest(symbol_or_symbols=top_symbols)
-    latest_quotes = data_client.get_stock_latest_quote(quote_req)
-
-    # ── Step 4: buy / trim each target asset ─────────────────────────────────
-    positions = {p.symbol: p for p in trading_client.get_all_positions()}
-
-    for symbol in top_symbols:
-        current_value = float(positions[symbol].market_value) if symbol in positions else 0.0
-        delta         = target_each - current_value
-
-        if delta >= MIN_NOTIONAL:
-            quote = latest_quotes.get(symbol)
-            if quote is None:
-                logger.error(f"No quote for {symbol} — skipping bracket buy")
-                continue
-            ref_price    = float(quote.ask_price)
-            qty          = int(delta // ref_price)   # whole shares only
-            if qty < 1:
-                logger.info(
-                    f"SKIP {symbol}: ${delta:,.2f} buys < 1 share at ${ref_price:,.2f}"
-                )
-                continue
-            stop_price   = round(ref_price * (1 - STOP_LOSS_PCT), 2)
-            target_price = round(ref_price * (1 + TAKE_PROFIT_PCT), 2)
-            logger.info(
-                f"BRACKET  {symbol}  ref=${ref_price:,.2f}  "
-                f"stop=${stop_price:,.2f} (-{STOP_LOSS_PCT:.0%})  "
-                f"target=${target_price:,.2f} (+{TAKE_PROFIT_PCT:.0%})"
+        trading_client.submit_order(
+            MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=stop_price),
+                take_profit=TakeProfitRequest(limit_price=target_price),
             )
-            _submit(
-                trading_client,
-                MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                    order_class=OrderClass.BRACKET,
-                    stop_loss=StopLossRequest(stop_price=stop_price),
-                    take_profit=TakeProfitRequest(limit_price=target_price),
-                ),
-                f"BUY {symbol}  qty={qty}  ≈${qty * ref_price:,.2f}  "
-                f"SL=${stop_price:,.2f}  TP=${target_price:,.2f}",
-            )
+        )
 
-        elif delta <= -MIN_NOTIONAL:
-            pos           = positions[symbol]
-            current_price = float(pos.current_price)
-            qty_to_sell   = int(abs(delta) // current_price)
-            if qty_to_sell < 1:
-                logger.info(
-                    f"HOLD {symbol}  overweight ${-delta:,.2f} but < 1 share — skipping trim"
-                )
-                continue
-            _submit(
-                trading_client,
-                MarketOrderRequest(
-                    symbol=symbol, qty=qty_to_sell,
-                    side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
-                ),
-                f"TRIM {symbol}  qty={qty_to_sell}  (reduce overweight ${-delta:,.2f})",
-            )
+        logger.info(
+            f"ORDER SUBMITTED  BUY {symbol}  qty={qty}  "
+            f"SL=${stop_price:,.2f}  TP=${target_price:,.2f}"
+        )
+        return True
 
-        else:
-            logger.info(f"HOLD {symbol}  current=${current_value:,.2f}  already at target")
+    except Exception as exc:
+        logger.error(f"ORDER FAILED  {symbol}  —  {exc}")
+        return False
+
+# ── Pending order check ───────────────────────────────────────────────────────
+
+def has_pending_orders(trading_client: TradingClient) -> bool:
+    """Return True if any open orders exist (unfilled entry or live bracket legs)."""
+    try:
+        orders = trading_client.get_orders(
+            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        )
+        return len(orders) > 0
+    except Exception as exc:
+        logger.warning(f"Could not check pending orders: {exc}")
+        return False
 
 # ── Portfolio snapshot ────────────────────────────────────────────────────────
 
-def log_portfolio(trading_client: TradingClient):
-    account   = trading_client.get_account()
-    positions = trading_client.get_all_positions()
-    logger.info(
-        f"PORTFOLIO  equity=${float(account.equity):,.2f}  "
-        f"cash=${float(account.cash):,.2f}"
-    )
-    if not positions:
-        logger.info("  (no open positions — fully in cash)")
-        return
-    for p in positions:
+def log_portfolio(trading_client: TradingClient) -> None:
+    try:
+        account   = trading_client.get_account()
+        positions = trading_client.get_all_positions()
         logger.info(
-            f"  {p.symbol:<5}  qty={float(p.qty):.0f}  "
-            f"value=${float(p.market_value):>10,.2f}  "
-            f"unrealised_PnL=${float(p.unrealized_pl):>8,.2f} "
-            f"({float(p.unrealized_plpc):.2%})"
+            f"PORTFOLIO  equity=${float(account.equity):,.2f}  "
+            f"cash=${float(account.cash):,.2f}"
         )
+        if not positions:
+            logger.info("  (no open positions)")
+            return
+        for p in positions:
+            logger.info(
+                f"  {p.symbol:<5}  qty={float(p.qty):.0f}  "
+                f"value=${float(p.market_value):>10,.2f}  "
+                f"unrealised_PnL=${float(p.unrealized_pl):>8,.2f} "
+                f"({float(p.unrealized_plpc):.2%})"
+            )
+    except Exception as exc:
+        logger.error(f"log_portfolio error: {exc}")
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def run():
+def run() -> None:
     logger.info("=" * 60)
-    logger.info("Stock Momentum Rotation Bot  —  starting")
-    logger.info(f"Universe         : {UNIVERSE}")
-    logger.info(f"Rebalance every  : {REBALANCE_EVERY_DAYS} days")
-    logger.info(f"Momentum window  : {MOMENTUM_DAYS} days")
-    logger.info(f"Positions held   : top {TOP_N}")
-    logger.info(f"Stop loss        : -{STOP_LOSS_PCT:.0%} from entry (bracket order)")
-    logger.info(f"Take profit      : +{TAKE_PROFIT_PCT:.0%} from entry (bracket order)")
+    logger.info("Leveraged ETF EMA Momentum Bracket Bot  —  starting")
+    logger.info(f"Universe        : {UNIVERSE}")
+    logger.info(f"Signal          : (EMA{EMA_FAST} - EMA{EMA_SLOW}) / price")
+    logger.info(f"Stop loss       : -{STOP_LOSS_PCT:.0%} from entry")
+    logger.info(f"Take profit     : +{TAKE_PROFIT_PCT:.0%} from entry")
+    logger.info(f"Position sizing : 1 position, fully allocated")
     logger.info("=" * 60)
 
     trading_client, data_client = init_clients()
-    account = trading_client.get_account()
-    logger.info(f"Connected  —  account equity=${float(account.equity):,.2f}")
+    logger.info(f"Connected — equity=${float(trading_client.get_account().equity):,.2f}")
 
-    last_rebalance: datetime | None = None
+    # Detect a position left over from a previous session
+    existing = trading_client.get_all_positions()
+    in_trade  = len(existing) > 0
+    if in_trade:
+        p = existing[0]
+        logger.info(
+            f"Existing position: {p.symbol}  qty={float(p.qty):.0f}  "
+            f"value=${float(p.market_value):,.2f} — monitoring bracket"
+        )
+    else:
+        logger.info("No open position — will score and enter on next market open")
 
     while True:
         try:
-            now   = datetime.now(timezone.utc)
-            clock = trading_client.get_clock()
+            wait_for_open(trading_client)
+            now       = datetime.now(timezone.utc)
+            positions = trading_client.get_all_positions()
 
-            if not clock.is_open:
-                next_open  = clock.next_open
-                sleep_secs = max(60, (next_open - now).total_seconds() + 60)
+            # ── Monitoring an open trade ──────────────────────────────────────
+            if in_trade:
+                if len(positions) > 0:
+                    logger.info(f"── Poll {now:%H:%M:%S} UTC ──")
+                    log_portfolio(trading_client)
+                    time.sleep(POLL_SECS)
+                    continue
+
+                # Position gone — confirm bracket legs have settled too
+                if has_pending_orders(trading_client):
+                    logger.info("Orders still settling — rechecking in 5 s…")
+                    time.sleep(5)
+                    continue
+
+                logger.info("★ BRACKET RESOLVED — position closed, rescoring immediately")
+                in_trade = False
+                # fall through to scoring with no sleep
+
+            # ── Looking for a new entry ───────────────────────────────────────
+
+            # Refuse to open a new bracket close to the close bell
+            remaining = mins_to_close(trading_client)
+            if remaining < MIN_CLOSE_MINS:
                 logger.info(
-                    f"Market closed — sleeping until "
-                    f"{next_open.strftime('%Y-%m-%d %H:%M %Z')} "
-                    f"({sleep_secs / 3600:.1f} h)"
+                    f"Only {remaining:.0f} min until close "
+                    f"(< {MIN_CLOSE_MINS} min buffer) — skipping, waiting for next open"
                 )
-                time.sleep(sleep_secs)
+                time.sleep(int(remaining * 60) + 120)
                 continue
 
-            logger.info(f"── Check at {now:%Y-%m-%d %H:%M:%S} UTC ──")
+            # Score and select
+            scores = compute_scores(data_client)
+            trade  = pick_trade(scores)
 
-            days_since = (now - last_rebalance).days if last_rebalance else REBALANCE_EVERY_DAYS
-            due        = days_since >= REBALANCE_EVERY_DAYS
+            if trade is None:
+                logger.info("No actionable EMA signal — staying in cash, polling in 60 s")
+                time.sleep(POLL_SECS)
+                continue
 
-            if due:
-                logger.info("Rebalance due — fetching market data…")
-                bars_df = fetch_bars(data_client)
-                scores  = score_assets(bars_df)
+            symbol, strength, reason = trade
+            logger.info(f"WINNER: {symbol}  signal_strength={strength:.4%}  reason={reason}")
 
-                if not scores:
-                    logger.warning("No scored assets — holding current positions, skipping rebalance")
-                else:
-                    ranked      = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-                    top_symbols = [sym for sym, _ in ranked[:TOP_N]]
+            # Final market-open check before submitting
+            if not trading_client.get_clock().is_open:
+                logger.info("Market just closed — will retry at next open")
+                continue
 
-                    logger.info("Momentum rank:")
-                    for i, (sym, mom) in enumerate(ranked, 1):
-                        tag = " ← SELECTED" if sym in top_symbols else ""
-                        logger.info(f"  {i:2d}. {sym:<5}  {mom:+.2%}{tag}")
-
-                    execute_rebalance(trading_client, data_client, top_symbols)
-                    last_rebalance = now
-                    logger.info(f"Rebalance complete — next in {REBALANCE_EVERY_DAYS} days")
+            placed = place_bracket(trading_client, data_client, symbol)
+            if placed:
+                in_trade = True
+                logger.info(f"Waiting {FILL_WAIT_SECS} s for entry fill…")
+                time.sleep(FILL_WAIT_SECS)
             else:
-                days_left = REBALANCE_EVERY_DAYS - days_since
-                logger.info(f"No rebalance needed — next in {days_left} day(s)")
-
-            log_portfolio(trading_client)
+                logger.warning("Placement failed — retrying in 60 s")
+                time.sleep(60)
 
         except Exception:
             logger.error("Unhandled exception in main loop:")
             logger.error(traceback.format_exc())
-            logger.info("Restarting loop in 60 seconds…")
+            logger.info("Restarting in 60 seconds…")
             time.sleep(60)
-            continue
-
-        logger.info("Sleeping 1 h until next check…")
-        time.sleep(3600)
 
 
 if __name__ == "__main__":
